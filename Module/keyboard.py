@@ -9,13 +9,16 @@ class KeyCaptureApp:
         self.root = root
         self.root.title("Key Capture")
         self.label = tk.Label(
-            root, text="Press any key...", font=('Helvetica', 16))
+            root, text="Press any key... (Esc to cancel)", font=('Helvetica', 16))
         self.label.pack(pady=20)
 
         # 设置焦点以便立即接收键盘事件
         self.root.focus_set()
         self.listener = None
+        self.mouse_listener = None
         self.event_result = None
+        self.done = False   # 是否已捕获到事件（区分“尚未捕获”与“取消”）
+        self._closed = False  # on_close 幂等保护
 
         # 绑定关闭事件以确保正确清理资源
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -25,18 +28,35 @@ class KeyCaptureApp:
         self.listener.start()
         self.mouse_listener = mouse.Listener(on_click=self.on_mouse_click)
         self.mouse_listener.start()
+        # 注意：pynput 的回调运行在钩子消息泵线程上（WH_KEYBOARD_LL / WH_MOUSE_LL）。
+        # 若在回调里调用 stop()/root.quit()，一旦其中任何调用阻塞，该线程将停止
+        # 泵消息，钩子链上所有后续的物理鼠标/键盘事件都会被挂起——表现为全系统
+        # 鼠标冻结。因此回调里只记录结果，收尾工作交给 Tk 主循环线程上的轮询器。
+        self.root.after(50, self._poll_result)
+
+    def _poll_result(self):
+        """在 Tk 主循环线程中轮询捕获结果，捕获完成后安全地停止监听并退出。"""
+        if self.done:
+            self.on_close()
+            return
+        self.root.after(50, self._poll_result)
 
     def on_press(self, key):
+        # 只在回调里记录结果，绝不在此停止监听器或操作 Tk
+        if self.done:
+            return
         if key == keyboard.Key.esc:
-            self.on_close()
-        if isinstance(key, keyboard.KeyCode):
+            self.event_result = None  # Esc 取消设置，返回原来的按键
+        elif isinstance(key, keyboard.KeyCode):
             self.event_result = hex(
                 key.vk) if key.vk is not None else 'UNKNOWN'
         else:
             self.event_result = hex(key.value.vk)
-        self.on_close()
+        self.done = True
 
     def on_mouse_click(self, x, y, button, pressed):
+        if self.done:
+            return
         mouse_vk_map = {
             mouse.Button.left: 0x01,   # VK_LBUTTON
             mouse.Button.right: 0x02,  # VK_RBUTTON
@@ -48,13 +68,21 @@ class KeyCaptureApp:
             self.event_result = hex(vk_code)
         else:
             self.event_result = 'UNKNOWN'
-        self.on_close()
+        self.done = True
 
     def on_close(self):
+        # 可能被多次触发（轮询器 / WM_DELETE_WINDOW），需要幂等
+        if self._closed:
+            return
+        self._closed = True
+        # 从 Tk 主循环线程停止监听器：pynput 的 stop() 只是向钩子线程投递
+        # WM_STOP 消息，不会阻塞；钩子线程随后自行退出并卸载钩子。
         if self.listener is not None:
             self.listener.stop()
+            self.listener = None
         if self.mouse_listener is not None:
             self.mouse_listener.stop()
+            self.mouse_listener = None
         self.root.quit()  # 使用 quit 而不是 destroy 以便返回结果
 
     def capture_event(self):
@@ -72,8 +100,11 @@ def get_keyboard_event(text="UNKNOWN"):
 
     thread = threading.Thread(target=capture_key)
     thread.start()
-    # 等待线程完成
-    thread.join()
+    # 等待线程完成（模态捕获）；加超时兜底，避免任何意外情况下卡死调用方 UI
+    thread.join(timeout=60)
+    if thread.is_alive():
+        # 兜底：理论上不会走到这里，但绝不能无限期阻塞 Qt 主线程
+        return text
 
     # 获取结果
     key = 'UNKNOWN' if result_queue.empty() else result_queue.get()

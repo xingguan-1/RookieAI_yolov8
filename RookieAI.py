@@ -91,6 +91,9 @@ def communication_Process(pipe, videoSignal_queue, videoSignal_stop_queue, float
             except Exception as e:
                 logger.error(f"发生错误: {e}")
                 information_output_queue.put(("error_log", f"未知错误: {e}"))
+        else:
+            # 无消息时短暂休眠，避免空转占满整个 CPU 核心
+            time.sleep(0.01)
 
 
 def start_capture_process_multie(shm_name, frame_shape, frame_dtype, frame_available_event,
@@ -723,6 +726,10 @@ def mouse_move_prosses(box_shm_name, box_lock, mouseMoveProssesSignal_queue, acc
     # 初始化 last_put_data 变量
     last_put_data = None
 
+    # 心跳/诊断日志节流
+    last_heartbeat = 0
+    last_aim_log = 0
+
     try:
         while True:
             '''信号检查部分'''
@@ -806,6 +813,14 @@ def mouse_move_prosses(box_shm_name, box_lock, mouseMoveProssesSignal_queue, acc
             closest_box = boxes[0]
             x1, y1, x2, y2, distance, unique_id = closest_box
 
+            # 心跳日志（10 秒一次）：确认本进程存活
+            if time.time() - last_heartbeat >= 10:
+                last_heartbeat = time.time()
+                logger.info(
+                    f"[aim-heartbeat] alive, uid={int(unique_id)} "
+                    f"aimbot_switch={aimbot_switch} trigger_mode={trigger_mode} "
+                    f"mouseMoveMode={mouseMoveMode}")
+
             # 检查是否有新数据
             if unique_id != last_unique_id:
                 # 有新数据
@@ -883,9 +898,22 @@ def mouse_move_prosses(box_shm_name, box_lock, mouseMoveProssesSignal_queue, acc
                         lockKey = int(lockKey, 16)  # 转换为十六进制整数
 
                     # 检查锁定键、鼠标侧键和 Shift 键是否按下
-                    lockKey_pressed = bool(win32api.GetKeyState(lockKey) & 0x8000)
-                    xbutton2_pressed = bool(win32api.GetKeyState(0x05) & 0x8000)  # 鼠标侧键
-                    shift_pressed = bool(win32api.GetKeyState(win32con.VK_SHIFT) & 0x8000)  # Shift 键
+                    # 注意：必须用 GetAsyncKeyState 实时读取硬件级按键状态。
+                    # GetKeyState 返回的是线程消息队列衍生状态，本进程没有消息泵，
+                    # 对鼠标键（热键设为鼠标按键时）会读不到按下状态，导致自瞄不触发。
+                    lockKey_pressed = bool(win32api.GetAsyncKeyState(lockKey) & 0x8000)
+                    xbutton2_pressed = bool(win32api.GetAsyncKeyState(0x05) & 0x8000)  # 鼠标侧键
+                    shift_pressed = bool(win32api.GetAsyncKeyState(win32con.VK_SHIFT) & 0x8000)  # Shift 键
+
+                    # 诊断日志（节流到 3 秒一次）：确认检测到目标、热键状态与移动指令
+                    if time.time() - last_aim_log >= 3:
+                        last_aim_log = time.time()
+                        logger.info(
+                            f"[aim-diag] uid={int(unique_id)} dist={distance:.1f} "
+                            f"lockKey={lockKey} pressed={lockKey_pressed} side={xbutton2_pressed} "
+                            f"aimbot_switch={aimbot_switch} in_range={target_is_within_range} "
+                            f"move_xy=({move_x:.1f},{move_y:.1f})"
+                        )
 
                     if trigger_mode == 'press':
                         # 按下模式：只需检测按键是否被按下
@@ -945,8 +973,16 @@ def mouse_move_prosses(box_shm_name, box_lock, mouseMoveProssesSignal_queue, acc
                         # logger.debug("重置规律移动状态")
                         last_offset_distance = None
                         target_switching = False
+
+            # 短暂休眠，避免循环空转占满整个 CPU 核心
+            time.sleep(0.001)
     except KeyboardInterrupt:
         pass
+    except Exception as e:
+        # 子进程没有控制台，未捕获异常不会显示在任何地方——必须写进日志
+        import traceback
+        logger.error(f"[aim] 进程异常退出: {type(e).__name__}: {e}")
+        logger.error("Traceback:\n" + "".join(traceback.format_exc()))
     finally:
         box_shm.close()
 
@@ -960,8 +996,17 @@ def accessibility_process(accessibilityProcessSignal_queue, mouseMoveMode='win32
     last_state_s = False
     last_state_d = False
 
+    # 心跳日志节流
+    last_heartbeat = 0
 
     while True:
+        # 心跳日志（10 秒一次）：确认本进程存活
+        if time.time() - last_heartbeat >= 10:
+            last_heartbeat = time.time()
+            logger.info(
+                f"[acc-heartbeat] alive, mouseMoveMode={mouseMoveMode} "
+                f"automatic_trigger_switch={automatic_trigger_switch} "
+                f"Trigger_conditions={Trigger_conditions} mouse_isdown={mouse_isdown}")
         '''信号检查部分'''
         if not accessibilityProcessSignal_queue.empty():
             command_data = accessibilityProcessSignal_queue.get()
@@ -1018,6 +1063,9 @@ def accessibility_process(accessibilityProcessSignal_queue, mouseMoveMode='win32
             last_state_w, last_state_a, last_state_s, last_state_d = control.emergencStop_valorant(
                 last_state_w, last_state_a, last_state_s, last_state_d
             )
+
+        # 短暂休眠，避免循环空转占满整个 CPU 核心
+        time.sleep(0.001)
 
 
 class RookieAiAPP:  # 主进程 (UI进程)
